@@ -8,7 +8,7 @@ for my discord https://discord.gg/2nR3JS9Q
 
 ***status:***
 
-Idkhop: Not working/not stable **(use at your own risk)**
+Idkhop: Working **(should be safe but idk)**
 
 
 credits:
