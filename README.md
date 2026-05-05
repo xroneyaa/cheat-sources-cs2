@@ -8,7 +8,7 @@ prebuilded version here: https://discord.gg/4wcQGnEWRQ
 
 ***status:***
 
-Idkhop: Working(1.41.5.8) **(should be safe but idk)**
+Idkhop(bunnyhop): Working(1.41.5.8) **(should be safe but idk)**
 
 
 credits:
