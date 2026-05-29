@@ -203,6 +203,7 @@ static bool          g_initialJumpArmed = false;
 static bool          g_landJumpArmed = false;
 static void* g_cachedPawn = nullptr;
 static void* g_cachedMvs  = nullptr;
+static int   g_lastResolveTick = -1;
 
 // tunables.
 // STAMINA_CAP set very high (off) until we know the real scale from logs.
@@ -226,6 +227,8 @@ static constexpr float AS_MIN_SPEED   = 60.0f; // don't strafe if we're barely m
 static constexpr float AS_STEP_DEG    = 1.6f;  // max yaw rotation per hook call (deg)
 static constexpr float AS_PI          = 3.14159265358979f;
 static constexpr int   VEL_MUL_HOLD_TICKS = 4;
+static constexpr int   PAWN_REFRESH_TICKS = 128;
+static constexpr bool  PERF_VERBOSE_LOGS = false;
 
 // diagnostic state. heartbeat prints a few times at startup regardless of
 // anything else so we know the hook is alive; after that, throttled to every
@@ -264,6 +267,34 @@ static bool TryWrite(const uintptr_t addr, const T& value) {
 
 static bool IsProbablyUserPtr(const uintptr_t ptr) {
 	return ptr >= 0x10000 && ptr < 0x0000800000000000ull;
+}
+
+static bool IsCommittedReadablePtr(const uintptr_t ptr) {
+	if (!IsProbablyUserPtr(ptr))
+		return false;
+
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!VirtualQuery(reinterpret_cast<const void*>(ptr), &mbi, sizeof(mbi)))
+		return false;
+	if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+		return false;
+
+	return true;
+}
+
+static bool IsProbablyGameObjectPtr(const uintptr_t ptr) {
+	if (!IsProbablyUserPtr(ptr))
+		return false;
+
+	MEMORY_BASIC_INFORMATION mbi{};
+	if (!VirtualQuery(reinterpret_cast<const void*>(ptr), &mbi, sizeof(mbi)))
+		return false;
+	if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+		return false;
+
+	// Real entities/pawns live on game heaps. If resolver returns a pointer
+	// into a loaded module image (0x7FF... client.dll range), it is a false hit.
+	return mbi.Type != MEM_IMAGE;
 }
 
 static int ClearJumpBitAt(const uintptr_t addr) {
@@ -326,6 +357,23 @@ static int ReadClientTick() {
 		return -1;
 
 	return tick;
+}
+
+static int ReadLocalPlayerSlot() {
+	if (!g_pNGC)
+		return -1;
+
+	void* ngc = nullptr;
+	if (!TryRead(reinterpret_cast<uintptr_t>(g_pNGC), ngc) || !ngc)
+		return -1;
+
+	int slot = -1;
+	if (!TryRead(reinterpret_cast<uintptr_t>(ngc) + offsets::dwNetworkGameClient_localPlayer, slot))
+		return -1;
+
+	if (slot < 0 || slot > 63)
+		return -1;
+	return slot;
 }
 
 static long long ReadQpc() {
@@ -394,7 +442,7 @@ static void* ResolveEntityFromHandlePageTable(const uint32_t handle) {
 	void*           ent = nullptr;
 	if (!TryRead(slot + offsets::ENT_SLOT_HANDLE, slotHandle) || slotHandle != handle)
 		return nullptr;
-	if (!TryRead(slot, ent))
+	if (!TryRead(slot, ent) || !IsProbablyGameObjectPtr(reinterpret_cast<uintptr_t>(ent)))
 		return nullptr;
 	return ent;
 }
@@ -411,15 +459,47 @@ static void* ResolveEntityFromHandleEntityList(const uint32_t handle) {
 		if (!entityList)
 			continue;
 
-		uintptr_t listChunk = 0;
-		if (!TryRead(entityList + 0x10 * listIndex + 0x8, listChunk) || !listChunk)
-			continue;
+		uintptr_t chunks[4] = {};
+		TryRead(entityList + 0x10ull * listIndex + 0x8, chunks[0]);
+		TryRead(entityList + 0x8ull * listIndex + 0x10, chunks[1]);
+		TryRead(entityList + 0x8ull * listIndex + 0x8, chunks[2]);
+		TryRead(entityList + 0x10ull * listIndex + 0x10, chunks[3]);
 
-		void* ent = nullptr;
-		if (TryRead(listChunk + 120ull * slotIndex, ent) && ent)
-			return ent;
+		for (const uintptr_t listChunk : chunks) {
+			if (!listChunk)
+				continue;
+
+			void* ent = nullptr;
+			if (TryRead(listChunk + 120ull * slotIndex, ent) && IsProbablyGameObjectPtr(reinterpret_cast<uintptr_t>(ent)))
+				return ent;
+		}
 	}
 
+	return nullptr;
+}
+
+static void* ResolvePawnFromController(void* controller, uint32_t* outHandle = nullptr) {
+	if (!IsProbablyGameObjectPtr(reinterpret_cast<uintptr_t>(controller)))
+		return nullptr;
+
+	uint32_t handle = UINT32_MAX;
+	if (!TryRead(reinterpret_cast<uintptr_t>(controller) + offsets::m_hPawn, handle) || handle == UINT32_MAX)
+		return nullptr;
+
+	if (outHandle)
+		*outHandle = handle;
+
+	if (void* pawn = ResolveEntityFromHandlePageTable(handle))
+		return pawn;
+	if (void* pawn = ResolveEntityFromHandleEntityList(handle))
+		return pawn;
+	return nullptr;
+}
+
+static void* ResolveDirectLocalPawn() {
+	void* pawn = nullptr;
+	if (TryRead(g_clientBase + offsets::dwLocalPlayerPawn, pawn) && IsProbablyGameObjectPtr(reinterpret_cast<uintptr_t>(pawn)))
+		return pawn;
 	return nullptr;
 }
 
@@ -431,27 +511,48 @@ static void* ResolveEntityFromHandleEntityList(const uint32_t handle) {
 //   pawn       = entityPageTable[handle pagebits][handle slotbits] (with
 //                serial check at slot+0x10)
 static void* ResolveLocalPawn(const unsigned slot) {
-	void* controller = nullptr;
 	const uintptr_t controllerBase = g_clientBase + offsets::dwLocalPlayerController;
-	if (!TryRead(controllerBase + sizeof(void*) * slot, controller) || !controller) {
-		// normal client uses slot 0; keep the old path as fallback.
-		TryRead(controllerBase, controller);
+	const int localSlot = ReadLocalPlayerSlot();
+	const int candidates[] = {
+		localSlot,
+		static_cast<int>(slot),
+		0,
+		1
+	};
+
+	for (int i = 0; i < static_cast<int>(sizeof(candidates) / sizeof(candidates[0])); ++i) {
+		const int candidate = candidates[i];
+		if (candidate < 0 || candidate > 63)
+			continue;
+
+		bool seen = false;
+		for (int j = 0; j < i; ++j) {
+			if (candidates[j] == candidate) {
+				seen = true;
+				break;
+			}
+		}
+		if (seen)
+			continue;
+
+		void* controller = nullptr;
+		if (!TryRead(controllerBase + sizeof(void*) * static_cast<uintptr_t>(candidate), controller))
+			continue;
+		if (void* pawn = ResolvePawnFromController(controller))
+			return pawn;
 	}
 
-	if (controller) {
-		uint32_t handle = UINT32_MAX;
-		if (TryRead(reinterpret_cast<uintptr_t>(controller) + offsets::m_hPawn, handle) && handle != UINT32_MAX) {
-			if (void* pawn = ResolveEntityFromHandlePageTable(handle))
-				return pawn;
-			if (void* pawn = ResolveEntityFromHandleEntityList(handle))
-				return pawn;
-		}
+	// Some dumps expose this as a single local-controller pointer rather than
+	// an indexed pointer array. Keep this path separate from the slot walk.
+	void* controller = nullptr;
+	if (TryRead(controllerBase, controller)) {
+		if (void* pawn = ResolvePawnFromController(controller))
+			return pawn;
 	}
 
 	// direct local pawn path came back in current dumps; keep it as a fallback
 	// so we still resolve even if controller/handle traversal shifts again.
-	void* pawn = nullptr;
-	if (TryRead(g_clientBase + offsets::dwLocalPlayerPawn, pawn) && pawn)
+	if (void* pawn = ResolveDirectLocalPawn())
 		return pawn;
 
 	return nullptr;
@@ -459,10 +560,25 @@ static void* ResolveLocalPawn(const unsigned slot) {
 
 // don't intercept while alt-tabbed or typing in the console / menu.
 static bool GameHasFocus() {
+	static DWORD s_lastCheckMs = 0;
+	static bool  s_lastFocused = true;
+
+	const DWORD now = GetTickCount();
+	if (now - s_lastCheckMs < 100)
+		return s_lastFocused;
+
+	s_lastCheckMs = now;
 	const HWND fg  = GetForegroundWindow();
 	DWORD      pid = 0;
 	GetWindowThreadProcessId(fg, &pid);
-	return pid == GetCurrentProcessId();
+	s_lastFocused = pid == GetCurrentProcessId();
+	return s_lastFocused;
+}
+
+static bool UnloadHotkeyPressed() {
+	return (GetAsyncKeyState(VK_END) & 0x8001) != 0
+	    || (GetAsyncKeyState(VK_DELETE) & 0x8001) != 0
+	    || (GetAsyncKeyState(VK_F11) & 0x8001) != 0;
 }
 
 // gather everything we read off the pawn/mvs once per hook call so pre- and
@@ -496,7 +612,7 @@ struct QAngle3 {
 };
 
 static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
-	if (!pawn)
+	if (!IsProbablyUserPtr(reinterpret_cast<uintptr_t>(pawn)))
 		return false;
 
 	auto* pawnB = static_cast<uint8_t*>(pawn);
@@ -508,10 +624,10 @@ static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
 
 	if (!TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_fFlags, flags)
 	    || !TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_hGroundEntity, hGround)
-	    || !TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_vecVelocity, vel)
-	    || !TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_angEyeAnglesVelocity, angVel))
+	    || !TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_vecVelocity, vel))
 		return false;
 
+	TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_angEyeAnglesVelocity, angVel);
 	TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_pMovementServices, mvs);
 
 	s.pawn     = pawn;
@@ -543,10 +659,25 @@ static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
 
 static TickSnapshot ReadTickSnapshot(const unsigned slot, const int tick) {
 	TickSnapshot s{};
+
+	// Fast path: once we have the real pawn, keep reading it directly. Walking
+	// controller -> handle -> entity table and VirtualQuery-validating pointers
+	// on every CreateMove was the main FPS killer while SPACE was held.
+	if (g_cachedPawn && tick >= 0 && g_lastResolveTick >= 0 && tick - g_lastResolveTick <= PAWN_REFRESH_TICKS) {
+		if (BuildSnapshotFromPawn(g_cachedPawn, s)) {
+			s.cached = true;
+			if (!s.mvs)
+				s.mvs = g_cachedMvs;
+			g_lastValidTick = tick;
+			return s;
+		}
+	}
+
 	if (BuildSnapshotFromPawn(ResolveLocalPawn(slot), s)) {
 		g_cachedPawn = s.pawn;
 		g_cachedMvs  = s.mvs;
 		g_lastValidTick = tick;
+		g_lastResolveTick = tick;
 		return s;
 	}
 
@@ -751,10 +882,19 @@ static void ForceFullVelocityState(const TickSnapshot& snap) {
 }
 
 static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, const uintptr_t cmd) {
-	const bool focused = GameHasFocus();
-	const bool held    = focused && (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+	if (UnloadHotkeyPressed()) {
+		InterlockedCompareExchange(&g_unloadReason, UNLOAD_USER, UNLOAD_NONE);
+		if (g_pForceJump)
+			TryWrite(reinterpret_cast<uintptr_t>(g_pForceJump), FJ_RELEASE);
+		oCreateMove(pThis, slot, cmd);
+		return;
+	}
+
+	const bool spaceDown = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+	const bool held      = spaceDown && GameHasFocus();
 	const int  tick    = ReadClientTick();
-	const TickSnapshot snap = ReadTickSnapshot(slot, tick);
+	const bool needSnapshot = held || g_prevHeld || g_heartbeatCount < 5;
+	const TickSnapshot snap = needSnapshot ? ReadTickSnapshot(slot, tick) : TickSnapshot{};
 	const bool newTick = tick >= 0 && tick != g_lastBhopTick;
 
 	if (g_heartbeatCount < 5) {
@@ -771,8 +911,10 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 	}
 
 	if (snap.valid && held && snap.onGround != g_prevOnGround) {
-		Log("[bhop] %s  spd=%.1f stam=%.1f\n",
-		    snap.onGround ? "LAND" : "JUMP", snap.speed2d, snap.stamina);
+		if (PERF_VERBOSE_LOGS) {
+			Log("[bhop] %s  spd=%.1f stam=%.1f\n",
+			    snap.onGround ? "LAND" : "JUMP", snap.speed2d, snap.stamina);
+		}
 		g_prevOnGround = snap.onGround;
 	}
 
@@ -797,7 +939,9 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 	}
 
 	oCreateMove(pThis, slot, cmd);
-	const TickSnapshot postSnap = ReadTickSnapshot(slot, tick);
+	TickSnapshot postSnap{};
+	if (snap.valid)
+		BuildSnapshotFromPawn(snap.pawn, postSnap);
 
 	if ((jumpDown || recentlyJumpedPre) && snap.mvs) {
 		ForceFullVelocityState(snap);
@@ -822,7 +966,7 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 
 	if (newTick) {
 		g_lastBhopTick = tick;
-		if (snap.valid && (tick - g_lastDiagTick >= 10 || g_lastDiagTick < 0)) {
+		if (PERF_VERBOSE_LOGS && snap.valid && (tick - g_lastDiagTick >= 10 || g_lastDiagTick < 0)) {
 			g_lastDiagTick = tick;
 			Log("[bhop] t=%d spd=%5.1f vz=%6.1f stam=%5.1f vm=%4.2f pvm=%4.2f lj=%d land=%d/%.2f/%5.1f %s fl=0x%X gh=0x%X fj=0x%X set=%d/%d clr=%d/%d\n",
 			    tick, snap.speed2d, snap.velZ, snap.stamina, snap.velMul, snap.velocityModifier, snap.lastJumpTick,
@@ -831,7 +975,31 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 			    g_lastCmdSetTick, g_lastCmdSetCount, g_lastCmdClearTick, g_lastCmdClearCount);
 		} else if (!snap.valid && (tick - g_lastDiagTick >= 128 || g_lastDiagTick < 0)) {
 			g_lastDiagTick = tick;
-			Log("[bhop] t=%d NO-PAWN fj=0x%X\n", tick, *g_pForceJump);
+			uintptr_t ctlSlot = 0;
+			uintptr_t ctl0 = 0;
+			uintptr_t ctlLocal = 0;
+			uintptr_t directPawn = 0;
+			uint32_t hSlot = UINT32_MAX;
+			uint32_t h0 = UINT32_MAX;
+			uint32_t hLocal = UINT32_MAX;
+			const int localSlot = ReadLocalPlayerSlot();
+			TryRead(g_clientBase + offsets::dwLocalPlayerController + sizeof(void*) * static_cast<uintptr_t>(slot), ctlSlot);
+			TryRead(g_clientBase + offsets::dwLocalPlayerController, ctl0);
+			if (localSlot >= 0)
+				TryRead(g_clientBase + offsets::dwLocalPlayerController + sizeof(void*) * static_cast<uintptr_t>(localSlot), ctlLocal);
+			TryRead(g_clientBase + offsets::dwLocalPlayerPawn, directPawn);
+			if (ctlSlot)
+				TryRead(ctlSlot + offsets::m_hPawn, hSlot);
+			if (ctl0)
+				TryRead(ctl0 + offsets::m_hPawn, h0);
+			if (ctlLocal)
+				TryRead(ctlLocal + offsets::m_hPawn, hLocal);
+			Log("[bhop] t=%d NO-PAWN slot=%u lslot=%d ctlS=%p/h%X ctlL=%p/h%X ctl0=%p/h%X lp=%p fj=0x%X\n",
+			    tick, slot, localSlot,
+			    reinterpret_cast<void*>(ctlSlot), hSlot,
+			    reinterpret_cast<void*>(ctlLocal), hLocal,
+			    reinterpret_cast<void*>(ctl0), h0,
+			    reinterpret_cast<void*>(directPawn), *g_pForceJump);
 		}
 	}
 }
@@ -878,9 +1046,9 @@ static DWORD WINAPI MainThread(const LPVOID hMod) {
 		Log("[!] MH_EnableHook\n");
 		return 1;
 	}
-	Log("[bhop] hook ON, SPACE=bhop, END=unload\n");
+	Log("[bhop] hook ON, SPACE=bhop, END/DEL/F11=unload\n");
 
-	while (g_unloadReason == UNLOAD_NONE && !(GetAsyncKeyState(VK_END) & 0x8000))
+	while (g_unloadReason == UNLOAD_NONE && !UnloadHotkeyPressed())
 		Sleep(50);
 
 	// if END got us out, mark it USER. if DllMain already flagged DETACH,
