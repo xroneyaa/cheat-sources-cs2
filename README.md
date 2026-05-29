@@ -8,7 +8,7 @@ prebuilded version here: https://discord.gg/4wcQGnEWRQ
 
 ***status:***
 
-Idkhop(bunnyhop): updated only in discord(1.41.6.4) 
+Idkhop(bunnyhop): not working (update today or tommorow) (1.41.6.5) 
 
 
 credits:
