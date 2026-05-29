@@ -78,6 +78,7 @@ namespace offsets {
     // engine2.dll, CNetworkGameClient, used for tick sync
     constexpr uintptr_t dwNetworkGameClient            = 0x90A1A0;
     constexpr uintptr_t dwNetworkGameClient_clientTick = 0x378;
+    constexpr uintptr_t dwNetworkGameClient_localPlayer = 0xF8;
 }
 
 // not using this yet but leaving it here for later (entity stuff, ground check, etc)
