@@ -205,6 +205,13 @@ static void* g_cachedPawn = nullptr;
 static void* g_cachedMvs  = nullptr;
 static int   g_lastResolveTick = -1;
 
+static void ResetCachedPawn() {
+	g_cachedPawn      = nullptr;
+	g_cachedMvs       = nullptr;
+	g_lastResolveTick = -1;
+	g_lastValidTick   = -1;
+}
+
 // tunables.
 // STAMINA_CAP set very high (off) until we know the real scale from logs.
 // YAW_DEADZONE / CMD_MAX_MOVE kept for the stashed cmd-move autostrafe path.
@@ -313,6 +320,27 @@ static int SetJumpBitAt(const uintptr_t addr) {
 
 	const uint64_t pressed = value | CMD_IN_JUMP;
 	return TryWrite(addr, pressed) ? 1 : 0;
+}
+
+static bool WriteForceJump(const uint32_t value) {
+	return g_pForceJump && TryWrite(reinterpret_cast<uintptr_t>(g_pForceJump), value);
+}
+
+static uint32_t ReadForceJumpValue() {
+	uint32_t value = 0;
+	if (!g_pForceJump || !TryRead(reinterpret_cast<uintptr_t>(g_pForceJump), value))
+		return 0;
+	return value;
+}
+
+static void ClearSubtickMoveWhen(void* mvs) {
+	if (!mvs)
+		return;
+
+	const float zero = 0.0f;
+	const uintptr_t base = reinterpret_cast<uintptr_t>(mvs) + offsets::m_arrForceSubtickMoveWhen;
+	for (int i = 0; i < 4; ++i)
+		TryWrite(base + sizeof(float) * static_cast<uintptr_t>(i), zero);
 }
 
 static int ClearJumpFromUserCmd(const uintptr_t cmd) {
@@ -657,13 +685,13 @@ static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
 	return true;
 }
 
-static TickSnapshot ReadTickSnapshot(const unsigned slot, const int tick) {
+static TickSnapshot ReadTickSnapshot(const unsigned slot, const int tick, const bool forceResolve = false) {
 	TickSnapshot s{};
 
 	// Fast path: once we have the real pawn, keep reading it directly. Walking
 	// controller -> handle -> entity table and VirtualQuery-validating pointers
 	// on every CreateMove was the main FPS killer while SPACE was held.
-	if (g_cachedPawn && tick >= 0 && g_lastResolveTick >= 0 && tick - g_lastResolveTick <= PAWN_REFRESH_TICKS) {
+	if (!forceResolve && g_cachedPawn && tick >= 0 && g_lastResolveTick >= 0 && tick - g_lastResolveTick <= PAWN_REFRESH_TICKS) {
 		if (BuildSnapshotFromPawn(g_cachedPawn, s)) {
 			s.cached = true;
 			if (!s.mvs)
@@ -684,7 +712,7 @@ static TickSnapshot ReadTickSnapshot(const unsigned slot, const int tick) {
 	// Transient local-player resolve misses happen around respawn/round state.
 	// Keep using the last good pawn pointer for a short window instead of
 	// immediately dropping to blind force-jump pulses.
-	if (g_cachedPawn && tick >= 0 && g_lastValidTick >= 0 && tick - g_lastValidTick <= SNAPSHOT_STALE_TICKS) {
+	if (!forceResolve && g_cachedPawn && tick >= 0 && g_lastValidTick >= 0 && tick - g_lastValidTick <= SNAPSHOT_STALE_TICKS) {
 		if (BuildSnapshotFromPawn(g_cachedPawn, s)) {
 			s.cached = true;
 			if (!s.mvs)
@@ -692,6 +720,9 @@ static TickSnapshot ReadTickSnapshot(const unsigned slot, const int tick) {
 			return s;
 		}
 	}
+
+	if (forceResolve)
+		ResetCachedPawn();
 
 	return s;
 }
@@ -724,8 +755,8 @@ static void ApplyAutostrafe(const TickSnapshot& s) {
 	auto* mvsB = static_cast<uint8_t*>(s.mvs);
 	// write BOTH the cmd-staging value (read by the builder for cmd.sidemove)
 	// AND the physics-consumed value so any immediate prediction step lines up.
-	*reinterpret_cast<float*>(mvsB + offsets::m_flCmdLeftMove) = side;
-	*reinterpret_cast<float*>(mvsB + offsets::m_flLeftMove)    = side;
+	TryWrite(reinterpret_cast<uintptr_t>(mvsB) + offsets::m_flCmdLeftMove, side);
+	TryWrite(reinterpret_cast<uintptr_t>(mvsB) + offsets::m_flLeftMove, side);
 }
 
 // normalize an angle to [-180, 180].
@@ -797,10 +828,13 @@ static void ApplyViewAutostrafe(const TickSnapshot& s) {
 		return;
 
 	auto*        pawnB    = static_cast<uint8_t*>(s.pawn);
-	const float* vel      = reinterpret_cast<const float*>(pawnB + offsets::m_vecVelocity);
-	const float  velYaw   = std::atan2(vel[1], vel[0]) * (180.0f / AS_PI); // [-180, 180]
-	float*       angles   = reinterpret_cast<float*>(pawnB + offsets::m_angEyeAngles);
-	const float  curYaw   = angles[1];
+	Vec3         vel{};
+	QAngle3      angles{};
+	if (!TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_vecVelocity, vel)
+	    || !TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_angEyeAngles, angles))
+		return;
+	const float  velYaw   = std::atan2(vel.y, vel.x) * (180.0f / AS_PI); // [-180, 180]
+	const float  curYaw   = angles.yaw;
 
 	// optimal airstrafe heading: perpendicular to velocity. pick whichever side
 	// is closer to where the player is currently looking, so the view only has
@@ -817,7 +851,8 @@ static void ApplyViewAutostrafe(const TickSnapshot& s) {
 	const float need      = WrapAngle(target - curYaw);
 	const float stepMag   = fabsf(need) < AS_STEP_DEG ? fabsf(need) : AS_STEP_DEG;
 	const float step      = (need > 0.0f ? 1.0f : -1.0f) * stepMag;
-	angles[1]             = WrapAngle(curYaw + step);
+	angles.yaw            = WrapAngle(curYaw + step);
+	TryWrite(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_angEyeAngles, angles);
 }
 
 static float ScoreJumpCandidate(const TickSnapshot& snap, const int tick, const float phase) {
@@ -894,7 +929,8 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 	const bool held      = spaceDown && GameHasFocus();
 	const int  tick    = ReadClientTick();
 	const bool needSnapshot = held || g_prevHeld || g_heartbeatCount < 5;
-	const TickSnapshot snap = needSnapshot ? ReadTickSnapshot(slot, tick) : TickSnapshot{};
+	const bool forceResolve = needSnapshot && held && !g_prevHeld;
+	const TickSnapshot snap = needSnapshot ? ReadTickSnapshot(slot, tick, forceResolve) : TickSnapshot{};
 	const bool newTick = tick >= 0 && tick != g_lastBhopTick;
 
 	if (g_heartbeatCount < 5) {
@@ -921,14 +957,11 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 	bool jumpDown = held && snap.valid && snap.onGround;
 	const bool recentlyJumpedPre = held && ShouldHoldVelMul(snap, tick);
 	if ((jumpDown || recentlyJumpedPre) && snap.mvs) {
-		float* arr = reinterpret_cast<float*>(static_cast<uint8_t*>(snap.mvs) +
-		                                     offsets::m_arrForceSubtickMoveWhen);
-		arr[0] = arr[1] = arr[2] = arr[3] = 0.0f;
-
+		ClearSubtickMoveWhen(snap.mvs);
 		ForceFullVelocityState(snap);
 	}
 
-	*g_pForceJump = jumpDown ? FJ_PRESS : FJ_RELEASE;
+	WriteForceJump(jumpDown ? FJ_PRESS : FJ_RELEASE);
 
 	if (!held) {
 		g_lastBhopTick = -1;
@@ -971,7 +1004,7 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 			Log("[bhop] t=%d spd=%5.1f vz=%6.1f stam=%5.1f vm=%4.2f pvm=%4.2f lj=%d land=%d/%.2f/%5.1f %s fl=0x%X gh=0x%X fj=0x%X set=%d/%d clr=%d/%d\n",
 			    tick, snap.speed2d, snap.velZ, snap.stamina, snap.velMul, snap.velocityModifier, snap.lastJumpTick,
 			    snap.lastLandedTick, snap.lastLandedFrac, snap.lastLandedSpeed,
-			    snap.onGround ? "GND" : "AIR", snap.flags, snap.groundHandle, *g_pForceJump,
+			    snap.onGround ? "GND" : "AIR", snap.flags, snap.groundHandle, ReadForceJumpValue(),
 			    g_lastCmdSetTick, g_lastCmdSetCount, g_lastCmdClearTick, g_lastCmdClearCount);
 		} else if (!snap.valid && (tick - g_lastDiagTick >= 128 || g_lastDiagTick < 0)) {
 			g_lastDiagTick = tick;
@@ -999,7 +1032,7 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 			    reinterpret_cast<void*>(ctlSlot), hSlot,
 			    reinterpret_cast<void*>(ctlLocal), hLocal,
 			    reinterpret_cast<void*>(ctl0), h0,
-			    reinterpret_cast<void*>(directPawn), *g_pForceJump);
+			    reinterpret_cast<void*>(directPawn), ReadForceJumpValue());
 		}
 	}
 }
@@ -1068,7 +1101,7 @@ static DWORD WINAPI MainThread(const LPVOID hMod) {
 		return 0;
 	}
 
-	*g_pForceJump = FJ_RELEASE;
+	WriteForceJump(FJ_RELEASE);
 	Log("[bhop] unloaded\n");
 	if (g_console)
 		fclose(g_console);
