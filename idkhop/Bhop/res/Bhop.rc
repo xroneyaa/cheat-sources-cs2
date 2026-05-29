@@ -1,0 +1,6 @@
+#include <windows.h>
+
+// Numeric resource ID 101, type RCDATA — no named string in the PE resource
+// directory, so a `strings` grep cannot find the payload by name.
+// Path is relative to this .rc file; DLL must be built first (project ref).
+101 RCDATA "..\\..\\build\\CreateMoveDLL.dll"
