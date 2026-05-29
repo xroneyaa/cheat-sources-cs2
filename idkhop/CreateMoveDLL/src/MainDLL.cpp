@@ -250,6 +250,7 @@ static int  g_lastCmdClearTick = -1;
 static int  g_lastCmdClearCount = 0;
 static int  g_lastCmdSetTick = -1;
 static int  g_lastCmdSetCount = 0;
+static bool g_lastResolveRelaxed = false;
 
 template <typename T>
 static bool TryRead(const uintptr_t addr, T& out) {
@@ -276,8 +277,16 @@ static bool IsProbablyUserPtr(const uintptr_t ptr) {
 	return ptr >= 0x10000 && ptr < 0x0000800000000000ull;
 }
 
+static bool IsAlignedPtr(const uintptr_t ptr) {
+	return (ptr & 0x7ull) == 0;
+}
+
+static bool IsProbablyAlignedUserPtr(const uintptr_t ptr) {
+	return IsProbablyUserPtr(ptr) && IsAlignedPtr(ptr);
+}
+
 static bool IsCommittedReadablePtr(const uintptr_t ptr) {
-	if (!IsProbablyUserPtr(ptr))
+	if (!IsProbablyAlignedUserPtr(ptr))
 		return false;
 
 	MEMORY_BASIC_INFORMATION mbi{};
@@ -290,7 +299,7 @@ static bool IsCommittedReadablePtr(const uintptr_t ptr) {
 }
 
 static bool IsProbablyGameObjectPtr(const uintptr_t ptr) {
-	if (!IsProbablyUserPtr(ptr))
+	if (!IsProbablyAlignedUserPtr(ptr))
 		return false;
 
 	MEMORY_BASIC_INFORMATION mbi{};
@@ -468,10 +477,20 @@ static void* ResolveEntityFromHandlePageTable(const uint32_t handle) {
 	const uintptr_t slot = page + offsets::ENT_SLOT_STRIDE * (handle & 0x1FF);
 	uint32_t        slotHandle = 0;
 	void*           ent = nullptr;
-	if (!TryRead(slot + offsets::ENT_SLOT_HANDLE, slotHandle) || slotHandle != handle)
+	if (!TryRead(slot + offsets::ENT_SLOT_HANDLE, slotHandle))
 		return nullptr;
 	if (!TryRead(slot, ent) || !IsProbablyGameObjectPtr(reinterpret_cast<uintptr_t>(ent)))
 		return nullptr;
+
+	if (slotHandle != handle) {
+		// After death/round transitions CS2 can leave controller handles with a
+		// stale serial while the low entity index still points at the right slot.
+		// Accept only the same low index; BuildSnapshotFromPawn still validates
+		// the resulting object before we write anything to it.
+		if ((slotHandle & 0x7FFF) != (handle & 0x7FFF))
+			return nullptr;
+		g_lastResolveRelaxed = true;
+	}
 	return ent;
 }
 
@@ -539,6 +558,7 @@ static void* ResolveDirectLocalPawn() {
 //   pawn       = entityPageTable[handle pagebits][handle slotbits] (with
 //                serial check at slot+0x10)
 static void* ResolveLocalPawn(const unsigned slot) {
+	g_lastResolveRelaxed = false;
 	const uintptr_t controllerBase = g_clientBase + offsets::dwLocalPlayerController;
 	const int localSlot = ReadLocalPlayerSlot();
 	const int candidates[] = {
@@ -640,7 +660,7 @@ struct QAngle3 {
 };
 
 static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
-	if (!IsProbablyUserPtr(reinterpret_cast<uintptr_t>(pawn)))
+	if (!IsProbablyAlignedUserPtr(reinterpret_cast<uintptr_t>(pawn)))
 		return false;
 
 	auto* pawnB = static_cast<uint8_t*>(pawn);
@@ -657,6 +677,20 @@ static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
 
 	TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_angEyeAnglesVelocity, angVel);
 	TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_pMovementServices, mvs);
+	if (!IsProbablyAlignedUserPtr(reinterpret_cast<uintptr_t>(mvs)))
+		return false;
+
+	float stamina = 0.0f;
+	float velMul = 0.0f;
+	int lastJumpTick = -1;
+	if (!TryRead(reinterpret_cast<uintptr_t>(mvs) + offsets::m_flStamina, stamina)
+	    || !TryRead(reinterpret_cast<uintptr_t>(mvs) + offsets::m_flVelMulAtJumpStart, velMul)
+	    || !TryRead(reinterpret_cast<uintptr_t>(mvs) + offsets::m_nLastJumpTick, lastJumpTick))
+		return false;
+	if (!std::isfinite(stamina) || stamina < -1.0f || stamina > 1000.0f)
+		return false;
+	if (!std::isfinite(velMul) || velMul < -0.25f || velMul > 4.0f)
+		return false;
 
 	s.pawn     = pawn;
 	s.mvs      = mvs;
@@ -667,10 +701,10 @@ static bool BuildSnapshotFromPawn(void* pawn, TickSnapshot& s) {
 	s.velZ     = vel.z;
 	s.yawVel   = angVel.yaw;
 	TryRead(reinterpret_cast<uintptr_t>(pawnB) + offsets::m_flVelocityModifier, s.velocityModifier);
+	s.stamina = stamina;
+	s.velMul = velMul;
+	s.lastJumpTick = lastJumpTick;
 	if (mvs) {
-		TryRead(reinterpret_cast<uintptr_t>(mvs) + offsets::m_flStamina, s.stamina);
-		TryRead(reinterpret_cast<uintptr_t>(mvs) + offsets::m_flVelMulAtJumpStart, s.velMul);
-		TryRead(reinterpret_cast<uintptr_t>(mvs) + offsets::m_nLastJumpTick, s.lastJumpTick);
 
 		const uintptr_t modernJump = reinterpret_cast<uintptr_t>(mvs) + offsets::m_ModernJump;
 		float landedVelX = 0.0f;
@@ -707,6 +741,24 @@ static TickSnapshot ReadTickSnapshot(const unsigned slot, const int tick, const 
 		g_lastValidTick = tick;
 		g_lastResolveTick = tick;
 		return s;
+	}
+
+	// Round transitions and repeated deaths can desync the local-player slot
+	// while the controller array already contains the next live pawn. This is
+	// deliberately slow-path only: it runs after normal resolve/cache failed.
+	const uintptr_t controllerBase = g_clientBase + offsets::dwLocalPlayerController;
+	for (int candidate = 0; candidate < 64; ++candidate) {
+		void* controller = nullptr;
+		if (!TryRead(controllerBase + sizeof(void*) * static_cast<uintptr_t>(candidate), controller))
+			continue;
+		void* pawn = ResolvePawnFromController(controller);
+		if (BuildSnapshotFromPawn(pawn, s)) {
+			g_cachedPawn = s.pawn;
+			g_cachedMvs  = s.mvs;
+			g_lastValidTick = tick;
+			g_lastResolveTick = tick;
+			return s;
+		}
 	}
 
 	// Transient local-player resolve misses happen around respawn/round state.
@@ -961,7 +1013,16 @@ static void __fastcall hkCreateMove(const uintptr_t pThis, const unsigned slot, 
 		ForceFullVelocityState(snap);
 	}
 
-	WriteForceJump(jumpDown ? FJ_PRESS : FJ_RELEASE);
+	uint32_t forceJumpValue = jumpDown ? FJ_PRESS : FJ_RELEASE;
+	if (held && !snap.valid) {
+		// Last-resort recovery when local pawn is temporarily unavailable after
+		// death/respawn. No pawn/mvs writes happen here; only the global jump
+		// button is pulsed so the game can catch the next valid ground frame.
+		if (newTick)
+			g_tickFlip = !g_tickFlip;
+		forceJumpValue = g_tickFlip ? FJ_PRESS : FJ_RELEASE;
+	}
+	WriteForceJump(forceJumpValue);
 
 	if (!held) {
 		g_lastBhopTick = -1;
